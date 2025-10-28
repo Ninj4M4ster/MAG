@@ -1,0 +1,32 @@
+# Base configuration for MAG
+# Adjust values as needed or override with a custom config file passed to main.py
+
+data:
+	# path to directory containing cleaned CT data (relative to repo root)
+	data_dir: data/clean_ct
+	batch_size: 8
+	num_workers: 4
+	# optional image resize / crop size used by the datamodule
+	image_size: 256
+	shuffle: true
+	pin_memory: true
+
+model:
+	# simple model parameters — BaseModel should accept these keys (adjust if different)
+	name: simple_cnn
+	input_channels: 1
+	num_classes: 2
+	hidden_channels: 32
+	dropout: 0.2
+
+training:
+	device: cuda
+	epochs: 20
+	lr: 1e-4
+	save_dir: models
+	log_interval: 10
+	seed: 42
+
+logging:
+	log_dir: experiments
+	level: INFO
