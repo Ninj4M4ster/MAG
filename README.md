@@ -25,6 +25,14 @@ python3 main.py --help
 
 See the data README for dataset details: [data/README.md](data/README.md)
 
+## Metrics
+
+- HISM (Histogram Intersection Similarity Method)
+- FID (Fréchet Inception Distance)
+- Human evalation (Blinded radiologist Turing test)
+- PSNR (Peak Signal-to-Noise Ratio)
+- SSIM (Structural Similarity Index Measure)
+
 ## Frameworks/libraries
 
 - PyTorch
