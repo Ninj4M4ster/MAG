@@ -245,3 +245,125 @@ class ADNTest(Base):
         ]
         func = lambda x: x * 0.5 + 0.5
         return self._get_visuals(lookup, n, func, False)
+
+
+class ADN_VAETrain(BaseTrain):
+    def __init__(self, learn_opts, loss_opts, g_type, d_type, **model_opts):
+        super(ADN_VAETrain, self).__init__(learn_opts, loss_opts)
+        g_opts, d_opts = model_opts[g_type], model_opts[d_type]
+        
+        # Init with VAE model
+        model_dict = dict(
+            adn = lambda: ADN_VAE(**g_opts),
+            nlayer = lambda: NLayerDiscriminator(**d_opts)
+        )
+        
+        # Generator
+        self.model_g = self._get_trainer(model_dict, g_type)
+        
+        # Discriminators (Low & High)
+        self.model_dl = add_gan_loss(self._get_trainer(model_dict, d_type))
+        self.model_dh = add_gan_loss(self._get_trainer(model_dict, d_type))
+        
+        loss_dict = dict(
+            l1 = nn.L1Loss,
+            kld = KLDLoss,
+            gl = (self.model_dl.get_g_loss, self.model_dl.get_d_loss),
+            gh = (self.model_dh.get_g_loss, self.model_dh.get_d_loss),
+        )
+        
+        # Create criterion
+        self.model_g._criterion["ll"] = self._get_criterion(loss_dict, self.wgts["ll"], "ll_")
+        self.model_g._criterion["lh"] = self._get_criterion(loss_dict, self.wgts["lh"], "lh_")
+        self.model_g._criterion["hh"] = self._get_criterion(loss_dict, self.wgts["hh"], "hh_")
+        self.model_g._criterion["lhl"] = self._get_criterion(loss_dict, self.wgts["lhl"], "lhl_")
+        
+        self.model_g._criterion["hlh"] = self._get_criterion(loss_dict, self.wgts["hlh"], "hlh_")
+        self.model_g._criterion["art"] = self._get_criterion(loss_dict, self.wgts["art"], "art_")
+        self.model_g._criterion["gl"] = self._get_criterion(loss_dict, self.wgts["gl"])
+        self.model_g._criterion["gh"] = self._get_criterion(loss_dict, self.wgts["gh"])
+        
+        self.model_g._criterion["kld"] = self._get_criterion(loss_dict, self.wgts.get("kld", [None, 0.0]), "kld_")
+        
+        print_model(self)
+        
+    def optimize(self, img_low, img_high, scaler=None):
+        self.img_low, self.img_high = self._match_device(img_low, img_high)
+        
+        self.model_g._clear()
+        self.model_dl._clear()
+        self.model_dh._clear()
+        
+        # --- 1. Low Quality Reconstruction & GAN ---
+        if self._nonzero_weight("gl", "lh", "ll", "kld"):
+            self.pred_ll, self.pred_lh = self.model_g.forward1(self.img_low)
+            
+            self.model_g._criterion["gl"](self.pred_lh, self.img_high)
+            self.model_g._criterion["lh"](self.pred_lh, self.img_high)
+            self.model_g._criterion["ll"](self.pred_ll, self.img_low)
+            
+            if hasattr(self.model_g, "mu_low") and hasattr(self.model_g, "logvar_low"):
+                self.model_g._criterion["kld"](self.model_g.mu_low, self.model_g.logvar_low)
+                
+        # --- 2. High Quality Reconstruction & GAN ---
+        if self._nonzero_weight("gh", "hh", "kld"):
+            if not hasattr(self, "pred_lh"):
+                _, self.pred_lh = self.model_g.forward1(self.img_low)
+                
+            self.pred_hl, self.pred_hh = self.model_g.forward2(self.img_low, self.img_high)
+            
+            self.model_g._criterion["gh"](self.pred_hl, self.img_low)
+            self.model_g._criterion["hh"](self.pred_hh, self.img_high)
+            
+            if hasattr(self.model_g, "mu_high") and hasattr(self.model_g, "logvar_high"):
+                self.model_g._criterion["kld"](self.model_g.mu_high, self.model_g.logvar_high)
+        
+        # --- 3. Cycle Consistency ---
+        if self._nonzero_weight("lhl"):
+            if not hasattr(self, 'pred_hl'): self.pred_hl, _ = self.model_g.forward2(self.img_low, self.img_high)
+            if not hasattr(self, 'pred_lh'): _ , self.pred_lh = self.model_g.forward1(self.img_low)
+            self.pred_lhl = self.model_g.forward_hl(self.pred_hl.detach(), self.pred_lh.detach())
+            self.model_g._criterion["lhl"](self.pred_lhl, self.img_low)
+            
+        if self._nonzero_weight("hlh"):
+            if not hasattr(self, 'pred_hl'): self.pred_hl, _ = self.model_g.forward2(self.img_low, self.img_high)
+            self.pred_hlh = self.model_g.forward_lh(self.pred_hl.detach())
+            self.model_g._criterion["hlh"](self.pred_hlh, self.img_high)
+
+        # --- 4. Artifact Consistency ---
+        if self._nonzero_weight("art"):
+             if not hasattr(self, 'pred_ll'): self.pred_ll, self.pred_lh = self.model_g.forward1(self.img_low)
+             if not hasattr(self, 'pred_hl'): self.pred_hl, _ = self.model_g.forward2(self.img_low, self.img_high)
+             
+             ll = self.img_low
+             hh = self.img_high
+             self.model_g._criterion["art"](ll - self.pred_lh, self.pred_hl - hh)
+            
+        # Update weights
+        self.model_g._update(scaler=scaler)
+
+        if self._nonzero_weight("gl"):
+            self.model_dl._update(scaler=scaler)
+
+        if self._nonzero_weight("gh"):
+            self.model_dh._update(scaler=scaler)
+
+        if scaler: scaler.update()
+
+        # Cleanup
+        if hasattr(self, 'pred_ll'): del self.pred_ll
+        if hasattr(self, 'pred_lh'): del self.pred_lh
+        if hasattr(self, 'pred_hl'): del self.pred_hl
+        if hasattr(self, 'pred_hh'): del self.pred_hh
+        if hasattr(self, 'pred_lhl'): del self.pred_lhl
+        if hasattr(self, 'pred_hlh'): del self.pred_hlh
+
+        self.loss = self._merge_loss(
+            self.model_dl._loss, self.model_dh._loss, self.model_g._loss)
+
+    def get_visuals(self, n=8):
+        lookup = [
+            ("l", "img_low"), ("ll", "pred_ll"), ("lh", "pred_lh"), ("lhl", "pred_lhl"),
+            ("h", "img_high"), ("hl", "pred_hl"), ("hh", "pred_hh"), ("hlh", "pred_hlh")]
+
+        return self._get_visuals(lookup, n)

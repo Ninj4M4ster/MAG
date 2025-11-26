@@ -1,1 +1,1 @@
-from .adn import ADNTrain, ADNTest
+from .adn import ADNTrain, ADNTest, ADN_VAETrain
