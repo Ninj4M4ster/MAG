@@ -190,3 +190,144 @@ class NLayerDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.model(input)
+    
+    
+class VAEEncoder(nn.Module):
+    """
+    Modified Encoder that outputs Mean (mu) and Log-Variance (logvar)
+    for the Variational Autoencoder
+    """
+    
+    def __init__(self, input_ch, base_ch, num_down, num_residual, res_norm="instance", down_norm="instance"):
+        super(VAEEncoder, self).__init__()
+        
+        # Init Convolution
+        self.conv0 = ConvolutionBlock(
+            in_channels = input_ch, out_channels=base_ch, kernel_size=7, stride=1,
+            padding=3, pad='reflect', norm=down_norm, activ='relu'
+        )
+        
+        # Downsampling Layers
+        output_ch = base_ch
+        for i in range(1, num_down+1):
+            m = ConvolutionBlock(
+                in_channels=output_ch,
+                out_channels=output_ch * 2,
+                kernel_size=4,
+                stride=2, padding=1, pad='reflect', norm=down_norm, activ='relu'
+                )
+            setattr(self, "conv{}".format(i), m)
+            output_ch*=2
+        
+        # Residual Layers
+        for i in range(num_residual):
+            setattr(self, "res{}".format(i),
+                    ResidualBlock(output_ch, pad='reflect', norm=res_norm, activ='relu')
+                    )
+        
+        self.layers = [getattr(self, "conv{}".format(i)) for i in range(num_down+1)] + \
+            [getattr(self, "res{}".format(i)) for i in range(num_residual)]
+            
+        
+        # VAE Projection Heads
+        # Mapping the features to mu and logvar. 
+        # Ussing 1x1 convs to keep spatial dimensions or it can maintain the last channel depth.
+        self.conv_mu = nn.Conv2d(output_ch, output_ch, kernel_size=3, padding=1, padding_mode='reflect')
+        self.conv_logvar = nn.Conv2d(output_ch, output_ch, kernel_size=3, padding=1, padding_mode='reflect')
+        
+    
+    def forward(self, x):
+        sides = []
+        for layer in self.layers:
+            x = layer(x)
+            sides.append(x)
+            
+        # Calc stats for VAE
+        mu = self.conv_mu(x)
+        logvar = self.conv_logvar(x)
+        
+        # Return mu, logvar and inverted sides 
+        return mu, logvar, sides[::-1]
+    
+    
+class ADN_VAE(nn.Module):
+    """
+    ADN network modified to use VAE principles on the content encoders
+    """
+    def __init__(self, input_ch=1, base_ch=64, num_down=2, num_residual=4, num_sides='all',
+                 res_norm='instance', down_norm='instance', up_norm='layer', fuse=True, shared_decoder=False):
+        super(ADN_VAE, self).__init__()
+        
+        self.n = num_down + num_residual + 1 if num_sides=='all' else num_sides
+        
+        # Use VAEEnocder for content (Low/High)
+        self.encoder_low = VAEEncoder(input_ch, base_ch, num_down, num_residual, res_norm, down_norm)
+        self.encoder_high = VAEEncoder(input_ch, base_ch, num_down, num_residual, res_norm, down_norm)
+        
+        self.encoder_art = VAEEncoder(input_ch, base_ch, num_down, num_residual, res_norm, down_norm)
+        
+        # FIX 2: Used self.n instead of undefined self.m
+        self.decoder = Decoder(input_ch, base_ch, num_down, num_residual, self.n, res_norm, up_norm, fuse)
+        self.decoder_art = self.decoder if shared_decoder else deepcopy(self.decoder)
+        
+    def reparemeterize(self, mu, logvar):
+        """
+        Reparameterization trick: z = mu + std * epsilon
+        """
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            # FIX 3: Used randn_like (Gaussian) instead of rand_like (Uniform)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        else:
+            return mu
+        
+    def forward1(self, x_low):
+        # Encode artifact
+        mu_art, _, sides = self.encoder_art(x_low)
+        self.saved = (x_low, sides)
+        
+        # Encode low quality content (VAE)
+        self.mu_low, self.logvar_low, _ = self.encoder_low(x_low)
+        z_low = self.reparemeterize(self.mu_low, self.logvar_low)
+        
+        # Decode
+        y1 = self.decoder_art(z_low, sides[-self.n:]) # Reconstruction (Low)
+        y2 = self.decoder(z_low) # Restoration (High)
+        
+        return y1, y2 
+    
+    def forward2(self, x_low, x_high):
+        if hasattr(self, "saved") and self.saved[0] is x_low:
+            sides = self.saved[1]
+        else:
+            _, _, sides = self.encoder_art(x_low)
+            
+        # Encode high quality content (VAE)
+        self.mu_high, self.logvar_high, _ = self.encoder_high(x_high)
+        z_high = self.reparemeterize(self.mu_high, self.logvar_high)
+        
+        # Decode
+        y1 = self.decoder_art(z_high, sides[-self.n:])
+        y2 = self.decoder(z_high)
+        return y1, y2
+    
+    def forward_lh(self, x_low):
+        # Inference Low -> High
+        mu, logvar, _ = self.encoder_low(x_low)
+        z = self.reparemeterize(mu, logvar)
+        y = self.decoder(z)
+        return y
+
+    def forward_hl(self, x_low, x_high):
+        # Inference High -> Low (Using artifact from x_low)
+        _, _, sides = self.encoder_art(x_low)
+        # FIX 4: Correct unpacking (ignoring sides from high encoder)
+        mu, logvar, _ = self.encoder_high(x_high)
+        z = self.reparemeterize(mu, logvar)
+        y = self.decoder_art(z, sides[-self.n:])
+        return y
+    
+    def forward(self, x):
+        """Standard forward (Inference: Low -> High)"""
+        return self.forward_lh(x)
