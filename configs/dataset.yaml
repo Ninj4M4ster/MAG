@@ -6,7 +6,7 @@ deep_lesion:
   scale: 0.5
   CTpara:
     imPixNum: 256
-    angSize: 0.1
+    angSize: 2.0 #0.1
     angNum: 320
     SOD: 1075
     imPixScale: '512 / 256 * 0.03'
