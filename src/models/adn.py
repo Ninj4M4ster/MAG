@@ -4,7 +4,7 @@ import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
 from .base import Base, BaseTrain
-from ..networks import ADN, NLayerDiscriminator, add_gan_loss
+from ..networks import ADN, NLayerDiscriminator, add_gan_loss, ADN_VAE
 from ..utils import print_model, get_device
 
 
@@ -367,3 +367,40 @@ class ADN_VAETrain(BaseTrain):
             ("h", "img_high"), ("hl", "pred_hl"), ("hh", "pred_hh"), ("hlh", "pred_hlh")]
 
         return self._get_visuals(lookup, n)
+
+
+
+class ADN_ArtifactGenerator(Base):
+    def __init__(self, g_type, **model_opts):
+        super(ADN_ArtifactGenerator, self).__init__()
+        g_opts = model_opts[g_type]
+           
+        model_dict = dict(adn=lambda: ADN_VAE(**g_opts))
+        self.model_g = model_dict[g_type]()
+
+        print_model(self)
+
+        self.eval() 
+
+    def generate_artifacts(self, img_clean, img_reference_artifact):
+        self.img_clean, self.img_ref = self._match_device(img_clean, img_reference_artifact)
+        
+        with torch.no_grad():
+            
+            self.generated_image = self.model_g.forward_hl(
+                x_low=self.img_ref,
+                x_high=self.img_clean
+            )
+            
+        return self.generated_image
+
+    def get_visuals(self, n=8):
+
+        lookup = []
+        if hasattr(self, 'img_clean'): lookup.append(("1_Clean_Input", "img_clean"))
+        if hasattr(self, 'img_ref'): lookup.append(("2_Artifact_Ref", "img_ref"))
+        if hasattr(self, 'generated_image'): lookup.append(("3_Generated_Output", "generated_image"))
+
+        func = lambda x: x * 0.5 + 0.5 
+        
+        return self._get_visuals(lookup, n, func, False)
